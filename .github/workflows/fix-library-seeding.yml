@@ -1,4 +1,4 @@
-name: Fix library seeding
+name: Add poster and details feature
 
 on:
   push:
@@ -10,29 +10,104 @@ permissions:
   contents: write
 
 jobs:
-  fix:
-    if: "!contains(github.event.head_commit.message, 'Stop automatic library seeding')"
+  patch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Remove automatic starter-library seeding
+
+      - name: Patch index.html
+        shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           p = Path('index.html')
-          s = p.read_text()
-          old = "if(!entries.length){await seedLibrary();const r=await db.from('library_entries').select('*,title:titles(*)').eq('user_id',user.id);entries=r.data||[]}"
-          new = ""
-          if old not in s:
-              raise SystemExit('Target code was not found; refusing to modify index.html')
-          p.write_text(s.replace(old, new, 1))
+          s = p.read_text(encoding='utf-8')
+          css = r'''
+.poster-cover{position:relative;overflow:hidden;background:#101c2f}
+.poster-cover img{width:100%;height:100%;object-fit:cover;display:block}
+.poster-cover .cover-fallback{position:absolute;inset:0;display:grid;place-items:center;padding:6px;text-align:center}
+.details-box{width:min(900px,100%);max-height:92vh;overflow:auto;padding:0}
+.details-hero{display:grid;grid-template-columns:220px 1fr;gap:24px;padding:24px}
+.details-poster{width:220px;height:315px;border-radius:7px;overflow:hidden;background:#101c2f;border:1px solid var(--line);box-shadow:var(--shadow)}
+.details-poster img{width:100%;height:100%;object-fit:cover}
+.details-main h2{font-size:28px;line-height:1.1;margin:0 0 8px}
+.details-original{color:var(--muted);margin-bottom:14px}
+.details-tags{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0 18px}
+.details-tag{border:1px solid var(--line);background:#0d192a;padding:5px 8px;border-radius:4px;font-size:12px;color:#c6d3e3}
+.details-synopsis{color:#d7dfeb;line-height:1.65}
+.details-section{border-top:1px solid var(--line);padding:18px 24px}
+.details-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.details-stat{background:#091322;border:1px solid var(--line);padding:11px;border-radius:6px}
+.details-stat b{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+.details-stat span{font-weight:800}
+.details-actions{display:flex;gap:9px;flex-wrap:wrap;padding:0 24px 24px}
+@media(max-width:650px){.details-hero{grid-template-columns:110px 1fr;gap:15px;padding:16px}.details-poster{width:110px;height:160px}.details-main h2{font-size:21px}.details-grid{grid-template-columns:1fr 1fr}.details-section{padding:15px 16px}.details-actions{padding:0 16px 18px}}
+'''
+          if '.details-box{' not in s:
+              s = s.replace('</style>', css + '</style>', 1)
+          feature = r'''
+/* JPOGGTracker media artwork + details */
+const mediaMetaCache = {};
+const mediaLookupCache = {};
+function mediaKey(e){ return `${e.title?.type||'anime'}:${String(e.title?.name||'').trim().toLowerCase()}`; }
+async function lookupMediaMeta(type,name){
+  const key=`${type}:${name.trim().toLowerCase()}`;
+  if(mediaMetaCache[key]) return mediaMetaCache[key];
+  if(mediaLookupCache[key]) return mediaLookupCache[key];
+  const endpoint=type==='manga'?'manga':'anime';
+  const task=(async()=>{
+    try{
+      const r=await fetch(`https://api.jikan.moe/v4/${endpoint}?q=${encodeURIComponent(name)}&limit=5&sfw=true`);
+      if(!r.ok) return null;
+      const j=await r.json(); const list=j.data||[]; if(!list.length) return null;
+      const norm=name.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+      const exact=list.find(x=>[x.title,x.title_english,x.title_japanese].filter(Boolean).some(t=>String(t).toLowerCase().replace(/[^a-z0-9]+/g,' ').trim()===norm));
+      const m=exact||list[0]; mediaMetaCache[key]=m; return m;
+    }catch(e){return null} finally{delete mediaLookupCache[key]}
+  })();
+  mediaLookupCache[key]=task; return task;
+}
+function mediaImage(m){return m?.images?.webp?.large_image_url||m?.images?.jpg?.large_image_url||m?.images?.webp?.image_url||m?.images?.jpg?.image_url||''}
+function mediaTypeLabel(e){return e.title?.type==='manga'?'Manga':'Anime'}
+function posterMarkup(e){
+  const name=e.title?.name||'Unknown'; const key=mediaKey(e); const m=mediaMetaCache[key]; const url=mediaImage(m);
+  return `<div class="cover poster-cover" data-poster-key="${esc(key)}" data-poster-type="${esc(e.title?.type||'anime')}" data-poster-name="${esc(name)}">${url?`<img src="${esc(url)}" alt="${esc(name)} cover" loading="lazy">`:`<span class="cover-fallback">${esc(initials(name))}</span>`}</div>`;
+}
+async function hydratePosters(){
+  for(const node of [...document.querySelectorAll('[data-poster-key]')]){
+    const m=await lookupMediaMeta(node.dataset.posterType,node.dataset.posterName); const url=mediaImage(m);
+    if(url && !node.querySelector('img')) node.innerHTML=`<img src="${esc(url)}" alt="${esc(node.dataset.posterName)} cover" loading="lazy">`;
+  }
+}
+async function openDetails(entryId){
+  const e=entries.find(x=>String(x.id)===String(entryId)); if(!e)return;
+  const name=e.title?.name||'Unknown title', type=e.title?.type||'anime';
+  modal.classList.remove('hidden'); modalBox.className='modal-box details-box'; modalBox.innerHTML=`<div class="empty">Loading ${esc(name)}…</div>`;
+  const m=await lookupMediaMeta(type,name), url=mediaImage(m), synopsis=m?.synopsis||'No synopsis is available for this title yet.';
+  const genres=(m?.genres||[]).map(g=>`<span class="details-tag">${esc(g.name)}</span>`).join('');
+  const people=type==='anime'?(m?.studios||[]).map(x=>x.name).join(', '):(m?.authors||[]).map(x=>x.name).join(', ');
+  const total=type==='anime'?(m?.episodes??e.total??'—'):(m?.chapters??e.total??'—');
+  const progress=e.progress??0;
+  modalBox.innerHTML=`<div class="details-hero"><div class="details-poster">${url?`<img src="${esc(url)}" alt="${esc(name)} cover">`:`<div class="cover-fallback">${esc(initials(name))}</div>`}</div><div class="details-main"><div class="eyebrow">${esc(mediaTypeLabel(e))}</div><h2>${esc(m?.title||name)}</h2>${m?.title_english&&m.title_english!==m.title?`<div class="details-original">${esc(m.title_english)}</div>`:''}<div class="details-tags">${genres||'<span class="details-tag">No genres listed</span>'}</div><p class="details-synopsis">${esc(synopsis)}</p></div></div><div class="details-section"><div class="details-grid"><div class="details-stat"><b>Episodes / Chapters</b><span>${esc(total)}</span></div><div class="details-stat"><b>Your progress</b><span>${esc(progress)} / ${esc(total)}</span></div><div class="details-stat"><b>Your rating</b><span>${e.rating==null?'—':esc(e.rating+'/10')}</span></div><div class="details-stat"><b>Status</b><span>${esc(e.status||'—')}</span></div><div class="details-stat"><b>Release</b><span>${esc(m?.year||m?.published?.string||m?.aired?.string||'—')}</span></div><div class="details-stat"><b>Score</b><span>${m?.score!=null?esc(m.score+'/10'):'—'}</span></div><div class="details-stat"><b>${type==='anime'?'Studios':'Authors'}</b><span>${esc(people||'—')}</span></div><div class="details-stat"><b>Source</b><span>${esc(m?.source||'—')}</span></div><div class="details-stat"><b>Favorite</b><span>${e.favorite?'Yes':'No'}</span></div></div></div><div class="details-actions"><button class="btn primary" onclick="closeModal();openEdit('${esc(e.id)}')">Edit my entry</button><button class="btn" onclick="closeModal()">Close</button></div>`;
+}
+const _baseRender=render;
+render=function(){_baseRender();setTimeout(()=>{bindEntryRows();hydratePosters()},30)};
+function bindEntryRows(){
+  document.querySelectorAll('.anime').forEach(n=>{
+    const text=n.querySelector('.anime-name'); const e=entries.find(x=>x.title?.name===text?.textContent?.trim()); if(!e)return;
+    n.dataset.entryId=e.id; n.style.cursor='pointer';
+    const old=n.querySelector('.cover'); if(old && !old.dataset.posterKey){old.outerHTML=posterMarkup(e)}
+    if(!n.dataset.detailBound){n.dataset.detailBound='1';n.addEventListener('click',()=>openDetails(e.id))}
+  });
+}
+'''
+          if 'JPOGGTracker media artwork + details' not in s:
+              s=s.replace('</script>',feature+'\n</script>',1)
+          p.write_text(s,encoding='utf-8')
           PY
-      - name: Commit and remove this temporary workflow
-        run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add index.html
           git rm .github/workflows/fix-library-seeding.yml
-          git commit -m 'Stop automatic library seeding'
+          git commit -m 'Add anime and manga posters and details'
           git push
-# trigger
