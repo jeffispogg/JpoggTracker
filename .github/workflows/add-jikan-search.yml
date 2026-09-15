@@ -1,0 +1,44 @@
+name: Add Jikan posters and title search
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/add-jikan-search.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch Jikan integration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p=Path('index.html')
+          s=p.read_text()
+          old="async function loadData(){if(!user)return;let{data:p}=await db.from('profiles').select('*').eq('id',user.id).single();profile=p;if(!profile)return;let{data}=await db.from('library_entries').select('*,title:titles(*)').eq('user_id',user.id);entries=data||[]}"
+          new="async function loadData(){if(!user)return;let{data:p}=await db.from('profiles').select('*').eq('id',user.id).single();profile=p;if(!profile)return;let{data}=await db.from('library_entries').select('*,title:titles(*)').eq('user_id',user.id);entries=(data||[]).map(e=>{if(e.title){e.title.type=e.title.media_type;e.title.total=e.title.media_type==='anime'?e.title.total_episodes:e.title.total_chapters;e.title.favorite=e.is_favorite}return e})}"
+          if old in s: s=s.replace(old,new,1)
+          start=s.index('const metaCache=')
+          end=s.index('function imageOf',start)
+          meta='''const metaCache={},metaPromises={};\nasync function mediaMeta(type,name){let k=type+':'+name.toLowerCase();if(metaCache[k])return metaCache[k];if(metaPromises[k])return metaPromises[k];metaPromises[k]=(async()=>{let endpoint=type==='manga'?'manga':'anime';for(let attempt=0;attempt<3;attempt++){try{let r=await fetch(`https://api.jikan.moe/v4/${endpoint}?q=${encodeURIComponent(name)}&limit=5&sfw=true`);if(r.status===429){await new Promise(x=>setTimeout(x,1200*(attempt+1)));continue}if(!r.ok)return null;let j=await r.json(),list=j.data||[];if(!list.length)return null;let n=name.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();let m=list.find(x=>[x.title,x.title_english,x.title_japanese].filter(Boolean).some(t=>String(t).toLowerCase().replace(/[^a-z0-9]+/g,' ').trim()===n))||list[0];metaCache[k]=m;return m}catch(e){if(attempt<2)await new Promise(x=>setTimeout(x,700*(attempt+1)))}}return null})().finally(()=>delete metaPromises[k]);return metaPromises[k]}\n'''
+          s=s[:start]+meta+s[end:]
+          s=s.replace("if(n.dataset.done)return;","if(n.dataset.done)continue;",1)
+          pattern=r'async function openAdd\(\).*?function editFields'
+          replacement='''async function openAdd(){await titleSearchModal(null)}\nasync function titleSearchModal(edit){if(edit){$('modal').classList.remove('hidden');$('modalBox').className='modal-box';$('modalBox').innerHTML=`<h2>Edit entry</h2>${editFields(edit)}`;return} $('modal').classList.remove('hidden');$('modalBox').className='modal-box';$('modalBox').innerHTML=`<h2>Add title</h2><div class="form"><div class="field"><label>Search anime or manga</label><input id="newName" class="input" placeholder="Start typing a title…" autocomplete="off"></div><div class="field"><label>Type</label><select id="newType" class="select"><option value="anime">Anime</option><option value="manga">Manga</option></select></div><div id="searchResults" class="anime-list"></div><div id="selectedPreview"></div><div class="modal-actions"><button type="button" class="btn" onclick="closeModal()">Cancel</button><button type="button" class="btn primary" id="confirmAdd" disabled>Add to my library</button></div></div>`;let timer,selected=null,request=0;const run=async()=>{let q=$('newName').value.trim(),type=$('newType').value,id=++request;selected=null;$('confirmAdd').disabled=true;if(q.length<2){$('searchResults').innerHTML='';return}$('searchResults').innerHTML='<div class="empty">Searching…</div>';let endpoint=type==='manga'?'manga':'anime';try{let r=await fetch(`https://api.jikan.moe/v4/${endpoint}?q=${encodeURIComponent(q)}&limit=8&sfw=true`);if(r.status===429){$('searchResults').innerHTML='<div class="empty">Search is busy. Try again in a moment.</div>';return}let j=await r.json();if(id!==request)return;let list=j.data||[];$('searchResults').innerHTML=list.length?list.map((m,i)=>`<button type="button" class="anime" data-result="${i}" style="text-align:left;color:#fff"><div class="cover">${imageOf(m)?`<img src="${esc(imageOf(m))}" alt="" loading="lazy">`:`<span class="cover-fallback">${esc(initials(m.title))}</span>`}</div><div><div class="anime-name">${esc(m.title||'Untitled')}</div><div class="tags">${esc(m.year||'')} · ${esc(type==='anime'?(m.episodes??'?')+' episodes':(m.chapters??'?')+' chapters')} · ${m.score!=null?esc(m.score+'/10'):'No score'}</div></div></button>`).join(''):'<div class="empty">No matches found.</div>';$('searchResults').querySelectorAll('[data-result]').forEach(b=>b.onclick=()=>{selected=list[Number(b.dataset.result)];$('selectedPreview').innerHTML=`<div class="notice"><b>${esc(selected.title)}</b><br><span class="muted">${esc(selected.synopsis||'No synopsis available.')}</span></div>`;$('confirmAdd').disabled=false})}catch(e){$('searchResults').innerHTML='<div class="empty">Could not reach the title database.</div>'}};$('newName').oninput=()=>{clearTimeout(timer);timer=setTimeout(run,350)};$('newType').onchange=run;$('confirmAdd').onclick=async()=>{if(!selected)return;let type=$('newType').value,name=selected.title,total=type==='anime'?selected.episodes:selected.chapters;let{data:t,error:te}=await db.from('titles').select('*').eq('name',name).eq('media_type',type).maybeSingle();if(te){toast(te.message);return}if(!t){let r=await db.from('titles').insert({name,media_type:type,total_episodes:type==='anime'?total:null,total_chapters:type==='manga'?total:null,description:selected.synopsis||null,cover_url:imageOf(selected)||null}).select().single();if(r.error){toast(r.error.message);return}t=r.data}let r=await db.from('library_entries').insert({user_id:user.id,title_id:t.id,status:'planned',progress:0}).select('*,title:titles(*)').single();if(r.error){toast(r.error.message);return}r.data.title.type=r.data.title.media_type;r.data.title.total=r.data.title.media_type==='anime'?r.data.title.total_episodes:r.data.title.total_chapters;r.data.title.favorite=r.data.is_favorite;entries.push(r.data);closeModal();render();toast('Added to your library')};}\nfunction editFields'''
+          s2,n=re.subn(pattern,replacement,s,count=1,flags=re.S)
+          if n!=1: raise SystemExit('Add title block anchor not found')
+          p.write_text(s2)
+          PY
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.html
+          git diff --cached --quiet || git commit -m 'Add Jikan posters and searchable title picker'
+          git push
